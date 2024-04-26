@@ -1,0 +1,114 @@
+#!/bin/bash
+
+# Default group ID is 'default' if not provided as the first script argument
+GROUP_ID="${1:-default}"
+AGENTNAME="$(uname)-$(hostname)"
+
+# Environment variables
+echo "Setting up Wazuh agent environment variables..."
+echo "WAZUH_MANAGER='{{ PUFFIN_MANAGER }}'" > /tmp/wazuh_envs
+echo "WAZUH_MANAGER_PORT='{{ PUFFIN_MANAGER_PORT }}'" >> /tmp/wazuh_envs
+echo "WAZUH_AGENT_GROUP='$GROUP_ID'" >> /tmp/wazuh_envs
+
+KEY_URL="https://download.mdr.puffinsecurity.com/register/{{ CLIENT_ID }}?group=$GROUP_ID&name=$AGENTNAME"
+KEYS_FILE_PATH="/Library/Ossec/etc/client.keys"
+
+# Function to check if the script is run as root
+check_root() {
+    echo "Checking for root access..."  >&2
+    if [ "$(id -u)" -ne 0 ]; then 
+        echo "Please run as root or use sudo"  >&2
+        exit 1
+    fi
+}
+
+# Function to check if Wazuh is already installed and install it if not
+check_and_install() {
+    if [ ! -d "/Library/Ossec" ]; then
+        echo "Wazuh agent not found. Downloading and installing..."  >&2
+        DOWNLOADED_PATH=$(download_agent)
+        installer -pkg "${DOWNLOADED_PATH}" -target /
+        rm "${DOWNLOADED_PATH}"
+        echo "Installing agent key..."  >&2
+        yes | /Library/Ossec/bin/manage_agents -i "${KEY}"
+    fi
+}
+
+# Function to restart the Wazuh service
+restart_service() {
+    echo "Restarting Wazuh service..." >&2
+    /Library/Ossec/bin/wazuh-control start
+}
+
+# Function to download the Wazuh agent package
+download_agent() {
+    echo "Determining machine architecture..." >&2
+    ARCH=$(uname -m)
+    echo "Architecture is $ARCH" >&2
+
+    if [ "${ARCH}" == "x86_64" ]; then
+        PKG_NAME="wazuh-agent-4.7.0-1.intel64.pkg"
+    elif [ "${ARCH}" == "arm64" ]; then
+        PKG_NAME="wazuh-agent-4.7.0-1.arm64.pkg"
+    else
+        echo "Unsupported architecture." >&2
+        exit 1
+    fi
+
+    TEMP_DIR=$(mktemp -d)
+    echo "Temporary directory created at: $TEMP_DIR" >&2
+
+    DOWNLOAD_URL="https://packages.wazuh.com/4.x/macos/${PKG_NAME}"
+    echo "Downloading $PKG_NAME from $DOWNLOAD_URL" >&2
+
+    pushd "$TEMP_DIR" > /dev/null
+    curl -O "${DOWNLOAD_URL}"
+    if [ $? -ne 0 ]; then
+        echo "Failed to download the package." >&2
+        exit 1
+    fi
+    popd > /dev/null
+
+    echo "${TEMP_DIR}/${PKG_NAME}"
+}
+
+# Function to retrieve the agent key
+retrieve_key() {
+    echo "Retrieving agent key from $KEY_URL" >&2
+    KEY=$(curl -s $KEY_URL)
+    if [ -z "$KEY" ]; then
+        echo "Cannot retrieve key from server" >&2
+        exit 1
+    fi
+
+    # Attempt to decode the base64 key to verify it's valid
+    if ! echo "$KEY" | base64 --decode &> /dev/null; then
+        echo "Failed to get a valid key" >&2
+        exit 1
+    fi
+
+    echo $KEY
+}
+
+
+# Main function that orchestrates the steps
+main() {
+    check_root
+
+    if [ ! -f "$KEYS_FILE_PATH" ]; then
+        echo "Agent key file not found. Retrieving key..."  >&2
+        KEY=$(retrieve_key) || exit 1
+        echo "KEY: $KEY"
+    fi
+
+    check_and_install
+    restart_service
+
+    echo "Puffin agent installation complete."
+}
+
+# Start the main function
+main
+
+# Return to the original directory
+cd -
