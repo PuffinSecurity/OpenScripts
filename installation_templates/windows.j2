@@ -1,52 +1,77 @@
 # Set-ExecutionPolicy Unrestricted
 # Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 # iex ((iwr -Uri "https://download.mdr.puffinsecurity.com/download/windows/<DOWNLOAD_TOKEN>").Content)
+# Invoke-RestMethod -Uri "https://download.mdr.puffinsecurity.com/download/windows/<DOWNLOAD_TOKEN>" | Invoke-Expression
 
 
+<#
+.SYNOPSIS
+    PuffinSecurity Agent Installer.
+.DESCRIPTION
+    This script installs all of the required tooling for our SIEM offering. For details please check the website or contact us.
+.PARAMETER DeviceName
+Specifies the name we will register your device under.
+If not specified, it will default to a mix of the OS and Hostname.
+.PARAMETER Groups
+Specifies any groups you want to add this device to (Maximum 5)
+If not specified, we will use the 'default' group.
+#>
 param (
-    [string]$groupName = "default"
+    [String] $DeviceName = "$([System.Environment]::OSVersion.Platform)-$([System.Environment]::MachineName)"
+    [String[]] $Groups = @("default")
 )
+    
+$ErrorActionPreference = "Stop"
 
-$programFiles = (${env:ProgramFiles(x86)}, ${env:ProgramFiles} -ne $null)[0]
-#$programFiles = (${env:ProgramFiles}, ${env:ProgramFiles} -ne $null)[0]
+$PROGRAM_FILES =            (${env:ProgramFiles(x86)}, ${env:ProgramFiles} -ne $null)[0]
+    
+$PUFFIN_REGISTER_GROUPS =      $Groups | ForEach-Object { "group=$_" } | Join-String "&"
+$PUFFIN_REGISTER_URL =      "{{ REGISTER_URL }}?name=$DeviceName&$PUFFIN_REGISTER_GROUPS"
 
-$agentName = "$([System.Environment]::OSVersion.Platform)-$([System.Environment]::MachineName)"
-$keyUrl = "https://download.mdr.puffinsecurity.com/register/{{ CLIENT_ID }}?group=$groupName&name=$agentName"
-$keysFilePath = "$programFiles\ossec-agent\client.keys"
-$installKey = $false
+$WAZUH_PATH =               "$PROGRAM_FILES\ossec-agent"
+$WAZUH_AGENT_DOWNLOAD_URL = "https://packages.wazuh.com/4.x/windows/wazuh-agent-4.7.0-1.msi"
+$WAZUH_INSTALLER_FILENAME = "wazuh-agent-installer.msi"
+$WAZUH_AGENT_KEY_PATH =     "$WAZUH_PATH\client.keys"
+$WAZUH_MANAGE_AGENT_EXE =   "$WAZUH_PATH\manage_agents.exe"
+$WAZUH_AGENT_CONFIG_PATH =  "$WAZUH_PATH\internal_options.conf"
 
-# Download Wazuh agent installer
-Invoke-WebRequest -Uri "https://packages.wazuh.com/4.x/windows/wazuh-agent-4.7.0-1.msi" -OutFile "wazuh-agent-4.7.0-1.msi" | Wait-Process
+$SYSMON_DOWNLOAD_URL =      "https://download.sysinternals.com/files/Sysmon.zip"
+$SYSMON_PATH =              "$env:TEMP\Sysmon.zip"
 
-# Check if Wazuh agent is installed and install it if not
+$CHAINSAW_PATH =            "$PROGRAM_FILES\ossec-agent\puffinsecurity\"
+$CHAINSAW_DOWNLOAD_URL =    "https://github.com/WithSecureLabs/chainsaw/releases/download/v2.8.1/chainsaw_x86_64-pc-windows-msvc.zip"
+$CHAINSAW_ZIP_PATH =        Join-Path -Path $env:TEMP -ChildPath "chainsaw.zip"
+
+
+########
+# Download and install the agent if not already installed
 if (!(Get-Service wazuh-agent -ErrorAction SilentlyContinue)) {
-    msiexec.exe /I "wazuh-agent-4.7.0-1.msi" WAZUH_MANAGER='{{ PUFFIN_MANAGER }}' WAZUH_MANAGER_PORT='{{ PUFFIN_MANAGER_PORT }}' WAZUH_AGENT_GROUP="$groupName" /quiet | Wait-Process
-    $installKey = $true
-} elseif (!(Test-Path $keysFilePath)) {
-    $installKey = $true
-}
+    Invoke-WebRequest -Uri $WAZUH_AGENT_DOWNLOAD_URL -OutFile $WAZUH_INSTALLER_FILENAME | Wait-Process
+    
+    msiexec.exe /I $WAZUH_INSTALLER_FILENAME WAZUH_MANAGER='{{ WAZUH_MANAGER_URL }}' WAZUH_MANAGER_PORT='{{ WAZUH_MANAGER_PORT }}' /quiet | Wait-Process
+} 
 
-# Retrieve and validate the agent key if necessary
-if ($installKey) {
-    $key = Invoke-WebRequest -Uri $keyUrl -UseBasicParsing | Select-Object -ExpandProperty Content
+########
+# Register the agent
+# If no keys found from a previous install, register agent
+if (!(Test-Path $AGENT_KEY_PATH)) {
+    $key = Invoke-WebRequest -Uri $PUFFIN_REGISTER_URL -UseBasicParsing | Select-Object -ExpandProperty Content
+
     if ([string]::IsNullOrWhiteSpace($key) -or ![System.Convert]::FromBase64String($key)) {
         Write-Error "Failed to retrieve or decode the agent key"
         exit
     }
 
     # Install the agent key
-    $manageAgentsPath = "$programFiles\ossec-agent\manage_agents.exe"
-    Write-Output "y" | & $manageAgentsPath -i $key
-
-
-
+    Write-Output "y" | & $WAZUH_MANAGE_AGENT_EXE -i $key
 }
 
 
-$FileName = "$programFiles\ossec-agent\internal_options.conf"
-$FileOriginal = Get-Content $FileName
+########
+# Configure the agent
+# Allow for remote commands
+$FileOriginal = Get-Content $WAZUH_AGENT_CONFIG_PATH
 $Pattern = "wazuh_command.remote_commands"
-
 
 [String[]] $FileModified = @()
 foreach ($Line in $FileOriginal)
@@ -63,15 +88,14 @@ foreach ($Line in $FileOriginal)
 
 Set-Content $fileName $FileModified
 
-
-
-
-# Restart Wazuh agent service
+########
+# Restart the agent
 Restart-Service -Name wazuh -Force
 
-# VC_redist
-$architecture = [System.Environment]::Is64BitProcess
-if ($architecture) {
+
+########
+# Install VC_redist for the required arch
+if ([System.Environment]::Is64BitProcess) {
     $url = "https://aka.ms/vs/17/release/VC_redist.x64.exe"
     $fileName = "VC_redist.x64.exe"
 } else {
@@ -81,145 +105,35 @@ if ($architecture) {
 
 $downloadPath = Join-Path -Path $env:TEMP -ChildPath $fileName
 Invoke-WebRequest -Uri $url -OutFile $downloadPath
-$arguments = "/install /quiet /norestart"
-Start-Process -FilePath $downloadPath -ArgumentList $arguments -Wait -NoNewWindow
+Start-Process -FilePath $downloadPath /install /quiet /norestart $arguments -Wait -NoNewWindow
 Remove-Item -Path $downloadPath
 
-
-# Sysmon Installation
-$sysmonUrl = "https://download.sysinternals.com/files/Sysmon.zip"
-$sysmonPath = "$env:TEMP\Sysmon.zip"
-Invoke-WebRequest -Uri $sysmonUrl -OutFile $sysmonPath
-Expand-Archive  -Force -Path $sysmonPath -DestinationPath $env:TEMP -Force
+########
+# Install and configure Sysmon
+Invoke-WebRequest -Uri $SYSMON_DOWNLOAD_URL -OutFile $SYSMON_PATH
+Expand-Archive  -Force -Path $SYSMON_PATH -DestinationPath $env:TEMP -Force
 if ([System.Environment]::Is64BitOperatingSystem) {
     Start-Process "$env:TEMP\Sysmon64.exe" -ArgumentList "-i -accepteula" -Wait -NoNewWindow
 } else {
     Start-Process "$env:TEMP\Sysmon.exe" -ArgumentList "-i -accepteula" -Wait -NoNewWindow
 }
-Remove-Item $sysmonPath
+Remove-Item $SYSMON_PATH
+# TODO Configure Sysmon
 
-# Chainsaw Installation
-$chainsawDir = "$programFiles\ossec-agent\puffinsecurity\"
-if (-not (Test-Path $chainsawDir)) {
-    New-Item -Path $chainsawDir -ItemType Directory
+
+########
+# Install and configure Chainsaw
+if (-not (Test-Path $CHAINSAW_PATH)) {
+    New-Item -Path $CHAINSAW_PATH -ItemType Directory
 }
-$chainsawZipUrl = "https://github.com/WithSecureLabs/chainsaw/releases/download/v2.8.1/chainsaw_x86_64-pc-windows-msvc.zip"
-$chainsawZipPath = Join-Path -Path $env:TEMP -ChildPath "chainsaw.zip"
-Invoke-WebRequest -Uri $chainsawZipUrl -OutFile $chainsawZipPath
-Expand-Archive -Path $chainsawZipPath -DestinationPath $chainsawDir -Force
-Remove-Item $chainsawZipPath
+Invoke-WebRequest -Uri $CHAINSAW_DOWNLOAD_URL -OutFile $CHAINSAW_ZIP_PATH
+Expand-Archive -Path $CHAINSAW_ZIP_PATH -DestinationPath $CHAINSAW_PATH -Force
+Remove-Item $CHAINSAW_ZIP_PATH
 
 
-Add-MpPreference -ExclusionPath "$programFiles\ossec-agent\puffinsecurity\"
-
-
-# Sigma Rules Installation
-$sigmaDir = "$programFiles\ossec-agent\puffinsecurity\chainsaw"
-if (-not (Test-Path $sigmaDir)) {
-    New-Item -Path $sigmaDir -ItemType Directory
-}
-$sigmaZipUrl = "https://github.com/SigmaHQ/sigma/releases/download/r2024-03-26/sigma_all_rules.zip"
-$sigmaZipPath = Join-Path -Path $env:TEMP -ChildPath "sigma.zip"
-Invoke-WebRequest -Uri $sigmaZipUrl -OutFile $sigmaZipPath
-Expand-Archive -Path $sigmaZipPath -DestinationPath $sigmaDir -Force
-Remove-Item $sigmaZipPath
-
-# Additional configurations or installations can be added here
+# Add exclusion for rules
+Add-MpPreference -ExclusionPath $CHAINSAW_PATH
 
 # Set error preference
-$ErrorActionPreference = "Stop"
-
-
-@"
-################################
-### Script to execute Chainsaw - Identify Malicious activity recorded in WinEvtLogs using Sigma Rules
-### puffinsecurity  - info@puffinsecurity.com
-################################
-
-##########
-# Chainsaw will be run against all event logs found in the default location
-# Output converted to JSON and appended to active-responses.log
-##########
-
-##########
-# Chainsaw Version: v2.5.0
-##########
-
-`$ErrorActionPreference = 'SilentlyContinue'
-
-
-`$programFiles = (`${env:ProgramFiles(x86)}, `${env:ProgramFiles} -ne `$null)[0]
-#`$programFiles = (`${env:ProgramFiles}, `${env:ProgramFiles} -ne `$null)[0]
-
-
-# Analyse events recorded in last 5 Minutes. Convert Start Date to Timestamp
-`$start_date = (Get-Date).AddMinutes(-5)
-`$from = Get-Date -Date `$start_date -UFormat '+%Y-%m-%dT%H:%M:%S'
-
-# Create Chainsaw Output Folder if it doesn't exist
-`$chainsaw_output = `"`$env:TMP\chainsaw_output`"
-If(!(test-path `$chainsaw_output)) {
-    New-Item -ItemType Directory -Force -Path `$chainsaw_output
-}
-
-
-
-# Get the latest release data as JSON from SigmaHQ/sigma repository
-`$releaseData = Invoke-RestMethod -Uri 'https://api.github.com/repos/SigmaHQ/sigma/releases/latest'
-# Extract the tag_name from the latest release to form the download URL
-`$tag = `$releaseData.tag_name
-`$url = 'https://github.com/SigmaHQ/sigma/releases/download/' + `$tag + '/sigma_all_rules.zip'
-# Download the file
-Invoke-WebRequest -Uri `$url -OutFile "`$programFiles\ossec-agent\puffinsecurity\chainsaw\sigma_all_rules.zip"
-# Define the path to the zip file and the target directory
-`$zipPath = "`$programFiles\ossec-agent\puffinsecurity\chainsaw\sigma_all_rules.zip"
-`$extractPath = "`$programFiles\ossec-agent\puffinsecurity\chainsaw"
-# Use Expand-Archive to extract the zip file
-Expand-Archive -Path `$zipPath -DestinationPath `$extractPath -Force
-
-# Windows Sigma Path
-`$windows_path = "`$programFiles\ossec-agent\puffinsecurity\chainsaw\rules\windows"
-
-# Run Chainsaw and store JSONs in TMP folder
-& "`$programFiles\ossec-agent\puffinsecurity\chainsaw\chainsaw.exe" hunt C:\Windows\System32\winevt -s `$windows_path --mapping "`$programFiles\ossec-agent\puffinsecurity\chainsaw\mappings\sigma-event-logs-all.yml" --from `$from --output `"`$env:TMP\chainsaw_output\results.json`" --json --level high --level critical
-
-# Convert JSON to new line entry for every 'group'
-function Convert-JsonToNewLine(`$json) {
-    foreach(`$document in `$json) {
-        `$document.document | ConvertTo-Json -Compress -Depth 99 | foreach-object {
-            [pscustomobject]@{
-                group = `$document.group
-                kind = `$document.kind
-                document = `$_
-                event = `$document.document.data.Event.EventData
-                path = `$document.document.path
-                system = `$document.document.data.Event.System
-                name = `$document.name
-                timestamp = `$document.timestamp
-                authors = `$document.authors
-                level = `$document.level
-                source = `$document.source
-                status = `$document.status
-                falsepositives = `$document.falsepositives
-                id = `$document.id
-                logsource = `$document.logsource
-                references = `$document.references
-                tags = `$document.tags
-            } | ConvertTo-Json -Compress
-        }
-    }
-}
-
-# Define the file path
-`$file = "`$programFiles\ossec-agent\active-response\active-responses.log"
-
-# Convert JSONs to new line entry and append to active-responses.log
-Get-ChildItem `"`$env:TMP\chainsaw_output`" -Filter *.json | Foreach-Object {
-    `$Chainsaw_Array = Get-Content `$_.FullName | ConvertFrom-Json
-    Convert-JsonToNewLine `$Chainsaw_Array | Out-File -Append -Encoding ascii `$file
-}
-
-# Remove TMP JSON Folder
-Remove-Item -Path "`$env:TMP\chainsaw_output" -Recurse -Force
-
-"@ | Out-File -FilePath "$programFiles\ossec-agent\active-response\bin\chainsaw.ps1"
+#TODO DOWNLOAD FROM GIT
+ | Out-File -FilePath "$WAZUH_PATH\active-response\bin\chainsaw.ps1"
