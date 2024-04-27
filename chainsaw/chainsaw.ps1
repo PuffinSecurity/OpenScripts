@@ -5,13 +5,15 @@
 ################################
 
 ##########
-# Chainsaw will be run against all event logs found in the default location
-# Output converted to JSON and appended to active-responses.log
-##########
-
-##########
 # Chainsaw Version: v2.5.0
 ##########
+
+<#
+.SYNOPSIS
+    PuffinSecurity Chainsaw Runtime.
+.DESCRIPTION
+    This script runs Chainsaw and parses the output so our agent can pick it up.
+#>
 
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -31,6 +33,7 @@ $SIGMA_MAPPINGS_PATH        = "$CHAINSAW_PATH\mappings\sigma-event-logs-all.yml"
 $SIGMA_VERSION_FILE         = "$CHAINSAW_PATH\version.txt"
 $SIGMA_RELEASES_URL         = "https://api.github.com/repos/SigmaHQ/sigma/releases"
 
+$WINDOWS_EVENT_LOG_PATH     = "C:\Windows\System32\winevt"
 $ACTIVE_RESPONSES_PATH      = "$PROGRAM_FILES\ossec-agent\active-response\active-responses.log"
 
 ##########
@@ -67,7 +70,7 @@ If(!(test-path $CHAINSAW_TMP_PATH)) {
 }
 
 # Run Chainsaw and store JSONs in TMP folder
-& '$CHAINSAW_PATH\chainsaw.exe' hunt C:\Windows\System32\winevt -s $SIGMA_WINDOWS_RULES_PATH --mapping $SIGMA_MAPPINGS_PATH --from $HUNT_START_TIMESTAMP --output $CHAINSAW_TMP_OUTPUT --json --level high --level critical
+& '$CHAINSAW_PATH\chainsaw.exe' hunt $WINDOWS_EVENT_LOG_PATH -s $SIGMA_WINDOWS_RULES_PATH --mapping $SIGMA_MAPPINGS_PATH --from $HUNT_START_TIMESTAMP --output $CHAINSAW_TMP_OUTPUT --json --level high --level critical
 
 ##########
 # Parse Chainsaw output
